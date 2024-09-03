@@ -41,13 +41,19 @@ class APCng implements Adapter
     private $metaCache = [];
 
     /**
+     * @var int ttl for all apcu entries reserved for prometheus
+     */
+    private $ttl;
+
+    /**
      * APCng constructor.
      *
      * @param string $prometheusPrefix Prefix for APCu keys (defaults to {@see PROMETHEUS_PREFIX}).
+     * @param int $ttl ttl for all apcu entries reserved for prometheus, default is 120 days
      *
      * @throws StorageException
      */
-    public function __construct(string $prometheusPrefix = self::PROMETHEUS_PREFIX, int $decimalPrecision = 3)
+    public function __construct(string $prometheusPrefix = self::PROMETHEUS_PREFIX, int $decimalPrecision = 3, int $ttl = 10368000)
     {
         if (!extension_loaded('apcu')) {
             throw new StorageException('APCu extension is not loaded');
@@ -60,6 +66,7 @@ class APCng implements Adapter
         $this->metainfoCacheKey = implode(':', [ $this->prometheusPrefix, 'metainfocache' ]);
         $this->metaInfoCounterKey = implode(':', [ $this->prometheusPrefix, 'metainfocounter' ]);
         $this->metaInfoCountedMetricKeyPattern = implode(':', [ $this->prometheusPrefix, 'metainfocountedmetric_#COUNTER#' ]);
+        $this->ttl = $ttl;
 
         if ($decimalPrecision < 0 || $decimalPrecision > 6) {
             throw new UnexpectedValueException(
@@ -115,7 +122,7 @@ class APCng implements Adapter
         // Initialize and increment the bucket
         $bucketKey = $this->histogramBucketValueKey($data, $bucketToIncrease);
         if (!apcu_exists($bucketKey)) {
-            apcu_add($bucketKey, 0);
+            apcu_add($bucketKey, 0, $this->ttl);
         }
         apcu_inc($bucketKey);
     }
@@ -137,7 +144,7 @@ class APCng implements Adapter
     {
         // store value key; store metadata & labels if new
         $valueKey = $this->valueKey($data);
-        $new = apcu_add($valueKey, $this->encodeLabelValues($data['labelValues']), 0);
+        $new = apcu_add($valueKey, $this->encodeLabelValues($data['labelValues']), $this->ttl);
         if ($new) {
             $this->storeMetadata($data, false);
             $this->storeLabelKeys($data);
@@ -173,7 +180,7 @@ class APCng implements Adapter
         if ($data['command'] === Adapter::COMMAND_SET) {
             $new = $this->convertToIncrementalInteger($data['value']);
             if ($old === false) {
-                apcu_store($valueKey, $new, 0);
+                apcu_store($valueKey, $new, $this->ttl);
                 $this->storeMetadata($data);
                 $this->storeLabelKeys($data);
 
@@ -198,7 +205,7 @@ class APCng implements Adapter
         }
 
         if ($old === false) {
-            apcu_add($valueKey, 0, 0);
+            apcu_add($valueKey, 0, $this->ttl);
             $this->storeMetadata($data);
             $this->storeLabelKeys($data);
         }
@@ -220,7 +227,7 @@ class APCng implements Adapter
         $old = apcu_fetch($valueKey);
 
         if ($old === false) {
-            apcu_add($valueKey, 0, 0);
+            apcu_add($valueKey, 0, $this->ttl);
             $this->storeMetadata($data);
             $this->storeLabelKeys($data);
         }
@@ -274,7 +281,7 @@ class APCng implements Adapter
         $_item = $this->encodeLabelKey($item);
         if (!array_key_exists($_item, $arr)) {
             $arr[$_item] = 1;
-            apcu_store($key, $arr, 0);
+            apcu_store($key, $arr, $this->ttl);
         }
     }
 
@@ -356,7 +363,7 @@ class APCng implements Adapter
             $arr[$type][] = ['key' => $metaKey, 'value' => $metaInfo];
         }
 
-        apcu_store($this->metainfoCacheKey, $arr, 0);
+        apcu_store($this->metainfoCacheKey, $arr, $this->ttl);
 
         return $arr;
     }
@@ -430,33 +437,24 @@ class APCng implements Adapter
      *  [9] => ['/private', 'get', 'fail'],     [10] => ['/private', 'post', 'success'], [11] => ['/private', 'post', 'fail'],
      *  [12] => ['/metrics', 'put', 'success'], [13] => ['/metrics', 'put', 'fail'],     [14] => ['/metrics', 'get', 'success'],
      *  [15] => ['/metrics', 'get', 'fail'],    [16] => ['/metrics', 'post', 'success'], [17] => ['/metrics', 'post', 'fail']
-     * @param array<string> $labelNames
      * @param array<array> $labelValues
-     * @return array<array>
+     * @return Generator<array>
      */
-    private function buildPermutationTree(array $labelNames, array $labelValues): array /** @phpstan-ignore-line */
+    private function buildPermutationTree(array $labelValues): \Generator /** @phpstan-ignore-line */
     {
-        $treeRowCount = count(array_keys($labelNames));
-        $numElements = 1;
-        $treeInfo = [];
-        for ($i = $treeRowCount - 1; $i >= 0; $i--) {
-            $treeInfo[$i]['numInRow'] = count($labelValues[$i]);
-            $numElements *= $treeInfo[$i]['numInRow'];
-            $treeInfo[$i]['numInTree'] = $numElements;
-        }
-
-        $map = array_fill(0, $numElements, []);
-        for ($row = 0; $row < $treeRowCount; $row++) {
-            $col = $i = 0;
-            while ($i < $numElements) {
-                $val = $labelValues[$row][$col];
-                $map[$i] = array_merge($map[$i], array($val));
-                if (++$i % ($treeInfo[$row]['numInTree'] / $treeInfo[$row]['numInRow']) == 0) {
-                    $col = ++$col % $treeInfo[$row]['numInRow'];
+        if ([] != $labelValues) {
+            $lastIndex = array_key_last($labelValues);
+            $currentValue = array_pop($labelValues);
+            if ($currentValue != null) {
+                foreach ($this->buildPermutationTree($labelValues) as $prefix) {
+                    foreach ($currentValue as $value) {
+                        yield $prefix + [$lastIndex => $value];
+                    }
                 }
             }
+        } else {
+            yield [];
         }
-        return $map;
     }
 
     /**
@@ -557,10 +555,9 @@ class APCng implements Adapter
         if (isset($metaData['buckets'])) {
             $metaData['buckets'][] = 'sum';
             $labels[] = $metaData['buckets'];
-            $metaData['labelNames'][] = '__histogram_buckets';
         }
 
-        $labelValuesList = $this->buildPermutationTree($metaData['labelNames'], $labels);
+        $labelValuesList = $this->buildPermutationTree($labels);
         unset($labels);
         $histogramBucket = '';
         foreach ($labelValuesList as $labelValues) {
@@ -925,17 +922,17 @@ class APCng implements Adapter
             $toStore = json_encode($metaData);
         }
 
-        $stored = apcu_add($metaKey, $toStore, 0);
+        $stored = apcu_add($metaKey, $toStore, $this->ttl);
 
         if (!$stored) {
             return;
         }
 
-        apcu_add($this->metaInfoCounterKey, 0, 0);
+        apcu_add($this->metaInfoCounterKey, 0, $this->ttl);
         $counter = apcu_inc($this->metaInfoCounterKey);
 
         $newCountedMetricKey = $this->metaCounterKey($counter);
-        apcu_store($newCountedMetricKey, $metaKey, 0);
+        apcu_store($newCountedMetricKey, $metaKey, $this->ttl);
     }
 
     private function metaCounterKey(int $counter): string
